@@ -17,19 +17,9 @@ const loginSchema = z.object({
 function signJwt(user: any) {
   const secret = process.env.JWT_SECRET;
   const isProd = process.env.NODE_ENV === "production";
-
-  if (!secret && isProd) {
-    // di produksi: jangan jalan tanpa secret
-    throw new Error("JWT_SECRET is missing in production");
-  }
-  // di dev: boleh fallback supaya gampang tes lokal
+  if (!secret && isProd) throw new Error("JWT_SECRET is missing in production");
   const useSecret = secret || "supersecretkey-dev-only";
-
-  return jwt.sign(
-    { role: user.role },
-    useSecret,
-    { subject: String(user.id), expiresIn: "7d" }
-  );
+  return jwt.sign({ role: user.role }, useSecret, { subject: String(user.id), expiresIn: "7d" });
 }
 
 /* ========= POST /api/auth/login ========= */
@@ -43,26 +33,19 @@ router.post("/login", async (req, res) => {
     const email = parsed.data.email.trim().toLowerCase();
     const password = parsed.data.password;
 
-    // Ambil user + dua kemungkinan kolom hash
-    const user = await prisma.user.findUnique({
-      where: { email },
-      select: { id: true, name: true, email: true, role: true, password: true as any, passwordHash: true as any, isActive: true as any },
-    });
-
+    // ⬇️ TIDAK pakai select; ambil user apa adanya
+    const user = await prisma.user.findUnique({ where: { email } });
     if (!user) return res.status(401).json({ error: "Email or password invalid" });
-    if (user.isActive === false) return res.status(403).json({ error: "User is not active" });
+    if ((user as any).isActive === false) return res.status(403).json({ error: "User is not active" });
 
+    // dukung dua nama kolom hash: password / passwordHash
     const hash: string | undefined = (user as any).password ?? (user as any).passwordHash;
-    if (!hash) {
-      // skema DB kamu tidak punya kolom hash yang dikenali
-      return res.status(500).json({ error: "User has no password hash in DB" });
-    }
+    if (!hash) return res.status(500).json({ error: "User has no password hash in DB" });
 
     const ok = await bcrypt.compare(password, hash);
     if (!ok) return res.status(401).json({ error: "Email or password invalid" });
 
     const token = signJwt(user);
-
     const useCookie = String(process.env.AUTH_USE_COOKIE || "").toLowerCase() === "true";
     const isProd = process.env.NODE_ENV === "production";
 
@@ -76,14 +59,14 @@ router.post("/login", async (req, res) => {
       });
       return res.json({
         message: "Login success",
-        user: { id: user.id, name: user.name, email: user.email, role: user.role },
+        user: { id: user.id, name: (user as any).name, email: user.email, role: (user as any).role },
       });
     }
 
     return res.json({
       message: "Login success",
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      user: { id: user.id, name: (user as any).name, email: user.email, role: (user as any).role },
     });
   } catch (err: any) {
     console.error("LOGIN ERROR:", err?.message || err);
@@ -98,9 +81,8 @@ export function verifyToken(req, res, next) {
   const useCookie = String(process.env.AUTH_USE_COOKIE || "").toLowerCase() === "true";
   let token = "";
 
-  if (useCookie) {
-    token = req.cookies?.token || "";
-  } else {
+  if (useCookie) token = req.cookies?.token || "";
+  else {
     const auth = req.headers.authorization || "";
     if (auth.startsWith("Bearer ")) token = auth.slice(7).trim();
   }
@@ -113,7 +95,6 @@ export function verifyToken(req, res, next) {
     const sub = decoded?.sub;
     const role = decoded?.role;
     if (!sub || !role) return res.status(401).json({ error: "Invalid token payload" });
-
     req.user = { id: String(sub), role };
     next();
   } catch {
