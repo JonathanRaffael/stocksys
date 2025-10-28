@@ -1,0 +1,172 @@
+/// ================================
+///  Prisma schema — Stock QC System
+/// ================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/// ------- Enums -------
+enum Role {
+  IPQC
+  OQC
+  MASTER
+  ADMIN
+}
+
+enum Shift {
+  S1 // Shift 1
+  S2 // Shift 2
+  S3 // Shift 3
+}
+
+/// Log action untuk riwayat penginputan
+enum HistoryAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+/// ------- Users -------
+model User {
+  id        String       @id @default(uuid())
+  name      String
+  email     String       @unique
+  password  String
+  role      Role
+  isActive  Boolean      @default(true)
+
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  // relations
+  entries   DailyEntry[]   @relation("EntryAuthor")
+  updates   DailyEntry[]   @relation("EntryUpdater")
+  logs      EntryHistory[] // semua riwayat yang dilakukan user ini
+
+  @@index([role])
+}
+
+/// ------- Products -------
+model Product {
+  id            String         @id @default(uuid())
+  computerCode  String         @unique                 // ex: RTU17907301DW5T
+  name          String                                   // ex: S10528-5T (TY)
+  size          String?                                  // ex: "Tube 4.6x2.4 mm"
+  description   String?
+  uom           String?                                  // ex: "pcs"
+  isActive      Boolean        @default(true)
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  dailyEntries  DailyEntry[]
+  logs          EntryHistory[] // riwayat terkait produk ini
+
+  @@index([name])
+  @@index([computerCode])
+  @@index([isActive])
+}
+
+/// ------- Daily Entries (Harian per Produk & Shift) -------
+/// Satu baris = 1 produk x 1 tanggal x 1 shift.
+model DailyEntry {
+  id        String   @id @default(uuid())
+
+  // Kunci bisnis
+  productId String
+  date      DateTime @db.Date
+  shift     Shift
+
+  // Dimensi opsional (jika perlu)
+  plant     String?      // ex: "HT"
+  line      String?      // ex: "LINE-1"
+
+  // --- IPQC ---
+  beforeIpqc       Int @default(0)
+  afterIpqc        Int @default(0)
+
+  // --- Postcure ---
+  onGoingPostcured Int @default(0)
+  afterPostcured   Int @default(0)
+
+  // --- OQC ---
+  beforeOqc        Int @default(0)
+  afterOqc         Int @default(0)
+
+  // --- Lain-lain ---
+  onHoldOrReturn   Int @default(0)
+
+  // --- Audit ---
+  createdByUserId  String
+  createdByRole    Role
+  updatedByUserId  String?
+  note             String?
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // relations
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  author  User    @relation("EntryAuthor",  fields: [createdByUserId], references: [id], onDelete: Restrict)
+  updater User?   @relation("EntryUpdater", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+  logs    EntryHistory[]
+
+  // Constraint unik: 1 produk x 1 tanggal x 1 shift
+  @@unique([productId, date, shift])
+
+  // Index untuk query cepat (dashboard & laporan)
+  @@index([productId, date])
+  @@index([date])
+  @@index([productId, date, shift])
+  @@index([productId, date, plant, line])
+}
+
+/// ------- Entry History (Riwayat Penginputan) -------
+/// Mencatat setiap aksi CREATE/UPDATE/DELETE pada DailyEntry
+/// dengan snapshot dan perubahan (diff) agar tiap user bisa lihat histori mereka.
+model EntryHistory {
+  id           String        @id @default(uuid())
+
+  // Referensi ke DailyEntry (nullable agar log tetap ada jika entry dihapus)
+  dailyEntryId String?
+  dailyEntry   DailyEntry?   @relation(fields: [dailyEntryId], references: [id], onDelete: SetNull)
+
+  // Referensi ke Product (nullable + simpan denormalized snapshot)
+  productId    String?
+  product      Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  // Snapshot identitas produk (denormalized, supaya log tetap informatif meski product berubah/nonaktif)
+  productCode  String
+  productName  String
+
+  // Kunci bisnis disalin ke log agar mudah difilter tanpa join berat
+  date         DateTime      @db.Date
+  shift        Shift
+
+  // Aksi & pelaku
+  action       HistoryAction
+  byUserId     String
+  byUser       User          @relation(fields: [byUserId], references: [id], onDelete: Restrict)
+  byRole       Role
+
+  // Catatan & perubahan
+  note         String?
+  changes      Json?         // diff per field: { "beforeIpqc": {"old": 10, "new": 15}, ... }
+  snapshot     Json?         // snapshot lengkap row DailyEntry setelah aksi terjadi
+
+  createdAt    DateTime      @default(now())
+
+  // Index untuk akses cepat di halaman riwayat
+  @@index([byUserId, createdAt])
+  @@index([productId, date, shift])
+  @@index([productCode])
+  @@index([date])
+  @@index([action])
+  @@index([dailyEntryId])
+}
