@@ -10,6 +10,7 @@ import authRouter from "./routes/auth"
 import usersRouter from "./routes/users"
 import productsRouter from "./routes/products"
 import entriesRouter from "./routes/entries"
+import entriesPreviousRouter from "./routes/entries-previous"
 import ipqcRouter from "./routes/ipqc"
 import oqcRouter from "./routes/oqc"
 import historyRouter from "./routes/history"
@@ -27,8 +28,8 @@ app.set("trust proxy", true) // penting untuk cookie/session di belakang proxy (
  *  CORS (DEV + PROD)
  * ========================= */
 const allowlist = [
-  process.env.CLIENT_ORIGIN,        // ex: https://stocksys-client.vercel.app
-  "http://localhost:5173",          // Vite dev
+  process.env.CLIENT_ORIGIN, // ex: https://stocksys-client.vercel.app
+  "http://localhost:5173", // Vite dev
   "http://127.0.0.1:5173",
 ].filter(Boolean)
 
@@ -86,6 +87,7 @@ app.use("/api/ipqc/summary", ipqcSummaryRouter) // konsisten: /api/ipqc/summary
 
 // ---- IPQC/OQC & entries & history
 app.use("/api/entries", entriesRouter)
+app.use("/api/entries", entriesPreviousRouter)
 app.use("/api/ipqc", ipqcRouter)
 app.use("/api/oqc", oqcRouter)
 app.use("/api/history", historyRouter)

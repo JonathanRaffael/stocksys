@@ -10,10 +10,25 @@ const { PrismaClient, Role, Shift, Prisma } = prismaPkg
 const prisma = new PrismaClient()
 const router = express.Router()
 
-// ===== Helpers: date-only (aman untuk kolom @db.Date) =====
-const asDateOnly = (d) => new Date(`${d}T00:00:00.000Z`)
+/* =======================================================================
+   Helpers
+   ======================================================================= */
 
-// Builder perubahan sederhana untuk history
+/**
+ * asDateOnly
+ * Bangun "tanggal kalender" di UTC 00:00 dari string "YYYY-MM-DD".
+ * Aman untuk kolom @db.Date (MySQL/Postgres DATE), tidak terpengaruh timezone.
+ * Contoh: "2025-11-07" -> Date(2025-11-07T00:00:00Z)
+ */
+const asDateOnly = (d) => {
+  const [y, m, day] = String(d).split("-").map(Number)
+  if (!y || !m || !day) throw new Error(`Invalid date-only: ${d}`)
+  return new Date(Date.UTC(y, m - 1, day))
+}
+
+/**
+ * Diff sederhana untuk mencatat perubahan field di history.
+ */
 function diffFields(before, after, keys) {
   const changes = {}
   if (!before && after) {
@@ -34,20 +49,27 @@ function diffFields(before, after, keys) {
   return changes
 }
 
-// ========= Schemas =========
+/* =======================================================================
+   Schemas
+   ======================================================================= */
+
 const positiveInt = z.number().int().min(0)
 
 const createSchema = z.object({
   productId: z.string().uuid(),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), // YYYY-MM-DD (kalender bisnis)
   shift: z.nativeEnum(Shift),
   plant: z.string().nullable().optional(),
   line: z.string().nullable().optional(),
   note: z.string().nullable().optional(),
+
+  // IPQC
   beforeIpqc: positiveInt.optional(),
   afterIpqc: positiveInt.optional(),
   onGoingPostcured: positiveInt.optional(),
   afterPostcured: positiveInt.optional(),
+
+  // OQC
   beforeOqc: positiveInt.optional(),
   afterOqc: positiveInt.optional(),
   onHoldOrReturn: positiveInt.optional(),
@@ -66,13 +88,15 @@ const patchSchema = z.object({
   line: z.string().nullable().optional(),
 })
 
-// ========= GET /api/entries =========
+/* =======================================================================
+   GET /api/entries
+   ======================================================================= */
 router.get("/", async (req, res) => {
   try {
     const schema = z.object({
       productId: z.string().uuid().optional(),
-      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(), // from (inclusive) jika ada "to"
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),   // to (inclusive)
       shift: z.nativeEnum(Shift).optional(),
       plant: z.string().optional(),
       line: z.string().optional(),
@@ -80,8 +104,16 @@ router.get("/", async (req, res) => {
       type: z.enum(["IPQC", "OQC"]).optional(),
     })
 
-    const { productId, date, to, shift, plant, line, includeProduct = true, type } =
-      schema.parse(req.query)
+    const {
+      productId,
+      date,
+      to,
+      shift,
+      plant,
+      line,
+      includeProduct = true,
+      type,
+    } = schema.parse(req.query)
 
     const where = {}
     if (productId) where.productId = productId
@@ -89,12 +121,14 @@ router.get("/", async (req, res) => {
     if (plant) where.plant = plant
     if (line) where.line = line
 
+    // Filter tanggal (kolom DATE) aman dengan UTC-midnight
     if (date && to) {
       where.date = { gte: asDateOnly(date), lte: asDateOnly(to) }
     } else if (date) {
       where.date = asDateOnly(date)
     }
 
+    // Filter tipe IPQC / OQC berdasarkan field non-negatif
     if (type === "OQC") {
       where.OR = [
         { beforeOqc: { gt: -1 } },
@@ -125,7 +159,9 @@ router.get("/", async (req, res) => {
   }
 })
 
-// ========= POST /api/entries =========
+/* =======================================================================
+   POST /api/entries
+   ======================================================================= */
 router.post(
   "/",
   verifyToken,
@@ -136,15 +172,26 @@ router.post(
       const parsed = createSchema.parse(req.body)
       const role = req.user.role
       const userId = req.user.id
-      const day = asDateOnly(parsed.date)
+      const day = asDateOnly(parsed.date) // 👈 aman (UTC 00:00)
 
       const existing = await prisma.dailyEntry.findUnique({
-        where: { productId_date_shift: { productId: parsed.productId, date: day, shift: parsed.shift } },
+        where: {
+          productId_date_shift: {
+            productId: parsed.productId,
+            date: day,
+            shift: parsed.shift,
+          },
+        },
       })
 
       const zeros = {
-        beforeIpqc: 0, afterIpqc: 0, onGoingPostcured: 0, afterPostcured: 0,
-        beforeOqc: 0, afterOqc: 0, onHoldOrReturn: 0,
+        beforeIpqc: 0,
+        afterIpqc: 0,
+        onGoingPostcured: 0,
+        afterPostcured: 0,
+        beforeOqc: 0,
+        afterOqc: 0,
+        onHoldOrReturn: 0,
       }
 
       if (!existing) {
@@ -174,15 +221,27 @@ router.post(
         const created = await prisma.dailyEntry.create({ data: createData })
         const product = await prisma.product.findUnique({ where: { id: parsed.productId } })
 
-        const keys = ["beforeIpqc", "afterIpqc", "onGoingPostcured", "afterPostcured", "beforeOqc", "afterOqc", "onHoldOrReturn", "note", "plant", "line"]
+        const keys = [
+          "beforeIpqc",
+          "afterIpqc",
+          "onGoingPostcured",
+          "afterPostcured",
+          "beforeOqc",
+          "afterOqc",
+          "onHoldOrReturn",
+          "note",
+          "plant",
+          "line",
+        ]
         const changes = diffFields(null, created, keys)
+
         await prisma.entryHistory.create({
           data: {
             dailyEntryId: created.id,
             productId: created.productId,
             productCode: product?.computerCode ?? "",
             productName: product?.name ?? "",
-            date: created.date,
+            date: created.date, // kolom DATE (sudah benar)
             shift: created.shift,
             action: "CREATE",
             byUserId: userId,
@@ -221,7 +280,18 @@ router.post(
       })
 
       const product = await prisma.product.findUnique({ where: { id: existing.productId } })
-      const keys = ["beforeIpqc", "afterIpqc", "onGoingPostcured", "afterPostcured", "beforeOqc", "afterOqc", "onHoldOrReturn", "note", "plant", "line"]
+      const keys = [
+        "beforeIpqc",
+        "afterIpqc",
+        "onGoingPostcured",
+        "afterPostcured",
+        "beforeOqc",
+        "afterOqc",
+        "onHoldOrReturn",
+        "note",
+        "plant",
+        "line",
+      ]
       const changes = diffFields(existing, updated, keys)
 
       await prisma.entryHistory.create({
@@ -230,7 +300,7 @@ router.post(
           productId: updated.productId,
           productCode: product?.computerCode ?? "",
           productName: product?.name ?? "",
-          date: updated.date,
+          date: updated.date, // kolom DATE (sudah benar)
           shift: updated.shift,
           action: "UPDATE",
           byUserId: userId,
@@ -249,7 +319,9 @@ router.post(
   }
 )
 
-// ========= DELETE /api/entries/:id =========
+/* =======================================================================
+   DELETE /api/entries/:id
+   ======================================================================= */
 router.delete(
   "/:id",
   verifyToken,
@@ -257,7 +329,8 @@ router.delete(
   requireRole("ADMIN", "IPQC", "OQC"),
   async (req, res) => {
     const id = req.params.id
-    const validUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    const validUUID =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     if (!validUUID.test(id)) return res.status(400).json({ error: "Invalid id" })
 
     try {

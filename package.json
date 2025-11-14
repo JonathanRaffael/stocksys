@@ -19,7 +19,7 @@
     "prisma:studio": "prisma studio"
   },
   "dependencies": {
-    "@prisma/client": "^6.18.0",
+    "@prisma/client": "^6.19.0",
     "axios": "^1.13.0",
     "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",

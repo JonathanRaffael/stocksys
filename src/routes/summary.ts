@@ -18,6 +18,10 @@ const rangeUtcFromLocalWib = (ymd: string) => {
   return { startUtc, endUtc }
 }
 
+// Urutan shift: untuk akumulasi S1..shift sekarang
+const SHIFT_ORDER: Record<string, number> = { S1: 1, S2: 2, S3: 3 }
+const getShiftOrder = (s: string) => SHIFT_ORDER[s] ?? 0
+
 // ================= Routers =================
 export const summaryRouter = Router()       // -> /api/summary
 export const ipqcSummaryRouter = Router()   // -> /api/ipqc/summary
@@ -179,6 +183,8 @@ summaryRouter.get("/", async (req, res) => {
 
 /* ============================================================================
  * 2) KPI DASHBOARD IPQC: GET /api/ipqc/summary
+ *    - Akumulasi S1..shiftSaatIni untuk hari tsb
+ *    - Jika hari tsb belum ada data -> pakai total HARI TERAKHIR SEBELUMNYA
  * ==========================================================================*/
 const IpqcQuery = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -194,33 +200,108 @@ ipqcSummaryRouter.get("/summary", async (req, res) => {
     const { date, shift, plant, line } = IpqcQuery.parse(req.query)
     const { startUtc, endUtc } = rangeUtcFromLocalWib(date)
 
-    const where: any = {
+    const currentShiftOrder = getShiftOrder(String(shift))
+
+    // daftar shift yang diikutkan untuk hari ini (S1..shiftSekarang)
+    const shiftsUpToCurrent = (["S1", "S2", "S3"] as const).filter(
+      (s) => getShiftOrder(s) <= currentShiftOrder
+    )
+
+    // WHERE utk HARI & SHIFT SEKARANG (akumulasi S1..shiftSekarang)
+    const whereToday: any = {
       date: { gte: startUtc, lte: endUtc },
-      shift,
+      shift: { in: shiftsUpToCurrent },
       ...(plant && plant.trim() ? { plant } : {}),
       ...(line && line.trim() ? { line } : {}),
     }
 
-    const agg = await prisma.dailyEntry.aggregate({
-      _sum: {
-        beforeIpqc: true,
-        afterIpqc: true,
-        onGoingPostcured: true,
-        afterPostcured: true,
-        beforeOqc: true,
-        afterOqc: true,
-        onHoldOrReturn: true,
-      },
-      where,
-    })
+    // Cek dulu: hari ini ada data atau tidak?
+    const [anyToday, aggToday] = await Promise.all([
+      prisma.dailyEntry.findFirst({
+        where: whereToday,
+        select: { id: true },
+      }),
+      prisma.dailyEntry.aggregate({
+        _sum: {
+          beforeIpqc: true,
+          afterIpqc: true,
+          onGoingPostcured: true,
+          afterPostcured: true,
+          beforeOqc: true,
+          afterOqc: true,
+          onHoldOrReturn: true,
+        },
+        where: whereToday,
+      }),
+    ])
 
-    const totalBeforeIpqc = agg._sum.beforeIpqc ?? 0
-    const totalAfterIpqc = agg._sum.afterIpqc ?? 0
-    const totalOnGoingPostcured = agg._sum.onGoingPostcured ?? 0
-    const totalAfterPostcured = agg._sum.afterPostcured ?? 0
-    const totalBeforeOqc = agg._sum.beforeOqc ?? 0
-    const totalAfterOqc = agg._sum.afterOqc ?? 0
-    const totalHoldOrReturn = agg._sum.onHoldOrReturn ?? 0
+    let aggSource = aggToday
+
+    // Jika hari ini benar-benar nggak ada entry -> pakai HARI TERAKHIR SEBELUMNYA
+    if (!anyToday) {
+      const prevBaseWhere: any = {
+        date: { lt: startUtc }, // sebelum hari ini (WIB)
+        ...(plant && plant.trim() ? { plant } : {}),
+        ...(line && line.trim() ? { line } : {}),
+      }
+
+      // Cari satu entry terakhir (tanggal paling akhir) utk plant/line tsb
+      const lastPrev = await prisma.dailyEntry.findFirst({
+        where: prevBaseWhere,
+        orderBy: [{ date: "desc" }],
+        select: { date: true },
+      })
+
+      if (!lastPrev) {
+        // Tidak ada histori sama sekali -> balikin 0 semua
+        return res.json({
+          totalBeforeIpqc: 0,
+          totalAfterIpqc: 0,
+          totalOnGoingPostcured: 0,
+          totalAfterPostcured: 0,
+          totalBeforeOqc: 0,
+          totalAfterOqc: 0,
+          totalHoldOrReturn: 0,
+          netAvailable: 0,
+          passRateIpqc: 0,
+          passRatePostcure: 0,
+        })
+      }
+
+      // Konversi tanggal histori ke Y-M-D lokal WIB
+      const prevLocalYmd = new Date(lastPrev.date.getTime() + WIB_OFFSET_MS)
+        .toISOString()
+        .slice(0, 10)
+      const { startUtc: prevStartUtc, endUtc: prevEndUtc } = rangeUtcFromLocalWib(prevLocalYmd)
+
+      // Ambil SEMUA SHIFT di hari histori tsb (S1+S2+S3)
+      const aggPrev = await prisma.dailyEntry.aggregate({
+        _sum: {
+          beforeIpqc: true,
+          afterIpqc: true,
+          onGoingPostcured: true,
+          afterPostcured: true,
+          beforeOqc: true,
+          afterOqc: true,
+          onHoldOrReturn: true,
+        },
+        where: {
+          date: { gte: prevStartUtc, lte: prevEndUtc },
+          ...(plant && plant.trim() ? { plant } : {}),
+          ...(line && line.trim() ? { line } : {}),
+        },
+      })
+
+      aggSource = aggPrev
+    }
+
+    const totalBeforeIpqc = aggSource._sum.beforeIpqc ?? 0
+    const totalAfterIpqc = aggSource._sum.afterIpqc ?? 0
+    const totalOnGoingPostcured = aggSource._sum.onGoingPostcured ?? 0
+    const totalAfterPostcured = aggSource._sum.afterPostcured ?? 0
+    const totalBeforeOqc = aggSource._sum.beforeOqc ?? 0
+    const totalAfterOqc = aggSource._sum.afterOqc ?? 0
+    const totalHoldOrReturn = aggSource._sum.onHoldOrReturn ?? 0
 
     const passRateIpqc =
       totalBeforeIpqc > 0 ? Math.round((totalAfterIpqc / totalBeforeIpqc) * 100) : 0
