@@ -74,7 +74,6 @@ model Product {
 }
 
 /// ------- Daily Entries (Harian per Produk & Shift) -------
-/// Satu baris = 1 produk x 1 tanggal x 1 shift.
 model DailyEntry {
   id        String   @id @default(uuid())
 
@@ -83,7 +82,7 @@ model DailyEntry {
   date      DateTime @db.Date
   shift     Shift
 
-  // Dimensi opsional (jika perlu)
+  // Dimensi opsional
   plant     String?      // ex: "HT"
   line      String?      // ex: "LINE-1"
 
@@ -120,7 +119,7 @@ model DailyEntry {
   // Constraint unik: 1 produk x 1 tanggal x 1 shift
   @@unique([productId, date, shift])
 
-  // Index untuk query cepat (dashboard & laporan)
+  // Index
   @@index([productId, date])
   @@index([date])
   @@index([productId, date, shift])
@@ -128,8 +127,6 @@ model DailyEntry {
 }
 
 /// ------- Entry History (Riwayat Penginputan) -------
-/// Mencatat setiap aksi CREATE/UPDATE/DELETE pada DailyEntry
-/// dengan snapshot dan perubahan (diff) agar tiap user bisa lihat histori mereka.
 model EntryHistory {
   id           String        @id @default(uuid())
 
@@ -137,15 +134,15 @@ model EntryHistory {
   dailyEntryId String?
   dailyEntry   DailyEntry?   @relation(fields: [dailyEntryId], references: [id], onDelete: SetNull)
 
-  // Referensi ke Product (nullable + simpan denormalized snapshot)
+  // Referensi ke Product (nullable + snapshot)
   productId    String?
   product      Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
 
-  // Snapshot identitas produk (denormalized, supaya log tetap informatif meski product berubah/nonaktif)
+  // Snapshot identitas produk
   productCode  String
   productName  String
 
-  // Kunci bisnis disalin ke log agar mudah difilter tanpa join berat
+  // Kunci bisnis disalin ke log
   date         DateTime      @db.Date
   shift        Shift
 
@@ -157,12 +154,12 @@ model EntryHistory {
 
   // Catatan & perubahan
   note         String?
-  changes      Json?         // diff per field: { "beforeIpqc": {"old": 10, "new": 15}, ... }
-  snapshot     Json?         // snapshot lengkap row DailyEntry setelah aksi terjadi
+  changes      Json?         // diff
+  snapshot     Json?         // snapshot lengkap
 
   createdAt    DateTime      @default(now())
 
-  // Index untuk akses cepat di halaman riwayat
+  // Index
   @@index([byUserId, createdAt])
   @@index([productId, date, shift])
   @@index([productCode])

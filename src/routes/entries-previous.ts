@@ -9,11 +9,36 @@ const { PrismaClient } = prismaPkg
 const prisma = new PrismaClient()
 const router = express.Router()
 
+type Shift = "S1" | "S2" | "S3"
+
+export interface PreviousQtyResult {
+  found: boolean
+
+  // SISA per proses (dipakai untuk prefill / history / validasi input step berikutnya)
+  beforeIpqc: number
+  afterIpqc: number
+  afterPostcured: number
+
+  // Nilai kumulatif mentah (jumlah input per proses, bukan saldo)
+  rawBeforeIpqc: number
+  rawAfterIpqc: number
+  rawOnGoingPostcured: number
+  rawAfterPostcured: number
+
+  previousDate: string | null
+  previousShift: Shift | null
+  totalInputs: number
+}
+
 /**
  * Helper: convert date string ke UTC midnight
  * (cocok untuk kolom @db.Date)
  */
-const asDateOnly = (d: string) => {
+const asDateOnly = (d: string | Date): Date => {
+  if (d instanceof Date) {
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
+  }
+
   const [y, m, day] = String(d).split("-").map(Number)
   if (!y || !m || !day) throw new Error(`Invalid date-only: ${d}`)
   return new Date(Date.UTC(y, m - 1, day))
@@ -22,141 +47,174 @@ const asDateOnly = (d: string) => {
 /**
  * Helper: get shift order (S1 = 1, S2 = 2, S3 = 3)
  */
-const getShiftOrder = (shift: string): number => {
-  const shiftMap = { S1: 1, S2: 2, S3: 3 }
-  return shiftMap[shift as keyof typeof shiftMap] || 0
+const getShiftOrder = (shift: Shift): number => {
+  const shiftMap: Record<Shift, number> = { S1: 1, S2: 2, S3: 3 }
+  return shiftMap[shift] ?? 0
+}
+
+/**
+ * Core logic kumulatif + sisa per proses
+ *
+ * Sesuai maumu:
+ *
+ * - User bisa input dari proses mana saja:
+ *   * hanya Before IPQC  -> nambah stok di before
+ *   * hanya After IPQC   -> mengurangi stok before & menambah after
+ *   * hanya After Post   -> mengurangi stok after & menambah postcure
+ *
+ * - Pola input nyata di UI:
+ *   * Baris yang punya Before & After sekaligus (misal Before=2500, After=2500)
+ *     itu maksudnya: 2500 sudah diproses dari stok existing,
+ *     BUKAN nambah 2500 baru ke Before.
+ *
+ * - Maka:
+ *   * Before dianggap "penambahan baru" HANYA jika di baris itu
+ *     tidak ada After IPQC dan tidak ada After Postcured.
+ *   * After IPQC dan After Postcured SELALU dianggap mutasi proses.
+ */
+export const getPreviousQty = async (params: {
+  productId: string
+  date: string | Date
+  shift: Shift
+  prismaClient?: prismaPkg.PrismaClient
+}): Promise<PreviousQtyResult> => {
+  const { productId, date, shift, prismaClient } = params
+  const db = prismaClient ?? prisma
+
+  const currentDate = asDateOnly(date)
+  const currentShiftOrder = getShiftOrder(shift)
+
+  const shiftsUpToCurrent: Shift[] = (["S1", "S2", "S3"] as const).filter(
+    (s) => getShiftOrder(s) <= currentShiftOrder
+  )
+
+  const entries = await db.dailyEntry.findMany({
+    where: {
+      productId,
+      OR: [
+        { date: { lt: currentDate } },
+        {
+          date: currentDate,
+          shift: { in: shiftsUpToCurrent as any[] },
+        },
+      ],
+    },
+    orderBy: [{ date: "asc" }, { shift: "asc" }],
+    select: {
+      beforeIpqc: true,
+      afterIpqc: true,
+      onGoingPostcured: true,
+      afterPostcured: true,
+      date: true,
+      shift: true,
+    },
+  })
+
+  if (entries.length === 0) {
+    return {
+      found: false,
+      beforeIpqc: 0,
+      afterIpqc: 0,
+      afterPostcured: 0,
+      rawBeforeIpqc: 0,
+      rawAfterIpqc: 0,
+      rawOnGoingPostcured: 0,
+      rawAfterPostcured: 0,
+      previousDate: null,
+      previousShift: null,
+      totalInputs: 0,
+    }
+  }
+
+  const totalInputs = entries.length
+  const lastEntry = entries[entries.length - 1]
+
+  let rawBeforeIpqc = 0
+  let rawAfterIpqc = 0
+  let rawOnGoingPostcured = 0
+  let rawAfterPostcured = 0
+
+  for (const e of entries) {
+    const b = Math.max(0, e.beforeIpqc ?? 0)
+    const a = Math.max(0, e.afterIpqc ?? 0)
+    const og = Math.max(0, e.onGoingPostcured ?? 0)
+    const ap = Math.max(0, e.afterPostcured ?? 0)
+
+    // BEFORE IPQC:
+    // Dianggap penambahan stok baru HANYA jika tidak ada proses lanjut di baris ini.
+    const isPureBefore = b > 0 && a === 0 && ap === 0
+    if (isPureBefore) {
+      rawBeforeIpqc += b
+    }
+
+    // AFTER IPQC & AFTER POSTCURED: selalu dianggap mutasi proses
+    if (a > 0) {
+      rawAfterIpqc += a
+    }
+    if (ap > 0) {
+      rawAfterPostcured += ap
+    }
+    if (og > 0) {
+      rawOnGoingPostcured += og
+    }
+  }
+
+  // Sisa per proses (flow qty mengalir antar step)
+  const remainingBeforeIpqc = Math.max(0, rawBeforeIpqc - rawAfterIpqc)
+  const remainingAfterIpqc = Math.max(0, rawAfterIpqc - rawAfterPostcured)
+  const remainingAfterPostcured = rawAfterPostcured
+
+  return {
+    found: true,
+
+    beforeIpqc: remainingBeforeIpqc,
+    afterIpqc: remainingAfterIpqc,
+    afterPostcured: remainingAfterPostcured,
+
+    rawBeforeIpqc,
+    rawAfterIpqc,
+    rawOnGoingPostcured,
+    rawAfterPostcured,
+
+    previousDate: lastEntry.date.toISOString().slice(0, 10),
+    previousShift: lastEntry.shift as Shift,
+    totalInputs,
+  }
 }
 
 /**
  * GET /api/entries/previous-qty
- *
- * LOGIKA KUMULATIF + SISA PER PROSES:
- *
- * 1) Ambil semua entry untuk productId tsb dengan:
- *    - date < currentDate  -> semua shift (S1, S2, S3)
- *    - date = currentDate & shift <= currentShift -> hanya shift sampai saat ini
- *
- * 2) Dari kumpulan entry itu hitung:
- *    totalBeforeIpqc     = Σ beforeIpqc
- *    totalAfterIpqc      = Σ afterIpqc
- *    totalOnGoingPost    = Σ onGoingPostcured
- *    totalAfterPostcured = Σ afterPostcured
- *
- * 3) Stok "sisa" per proses:
- *    remainingBeforeIpqc    = max(0, totalBeforeIpqc - totalAfterIpqc)
- *    remainingAfterIpqc     = max(0, totalAfterIpqc - totalAfterPostcured)
- *    remainingAfterPostcure = totalAfterPostcured  // tahap terakhir (belum dikurangi proses berikutnya)
- *
- * Contoh:
- *  14: S1=1000, S2=2000, S3=2000 -> totalBefore=5000
- *  15 S1: input 5000 -> totalBefore=10000, totalAfter=0 -> remainingBefore=10000
- *  15 S2: input AfterIPQC=10000 -> totalBefore=10000, totalAfterIpqc=10000
- *          remainingBefore=0
- *  15 S3: input AfterPostcured=10000 -> totalAfterPostcured=10000
- *          remainingAfterIpqc = 10000 - 10000 = 0
  */
 router.get("/previous-qty", verifyToken, requireAuth, async (req, res) => {
+  const schema = z.object({
+    productId: z.string().uuid(),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    shift: z.enum(["S1", "S2", "S3"]),
+  })
+
   try {
-    const schema = z.object({
-      productId: z.string().uuid(),
-      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-      shift: z.enum(["S1", "S2", "S3"]),
-    })
-
     const { productId, date, shift } = schema.parse(req.query)
-    const currentDate = asDateOnly(date as string)
-    const currentShiftOrder = getShiftOrder(shift as string)
 
-    // Daftar shift yang diikutkan untuk HARI INI (S1..shiftSaatIni)
-    const shiftsUpToCurrent = (["S1", "S2", "S3"] as const).filter(
-      (s) => getShiftOrder(s) <= currentShiftOrder
-    )
-
-    // ✅ Ambil SEMUA ENTRY kumulatif untuk productId tsb:
-    //    - semua tanggal sebelum currentDate (lt)
-    //    - + tanggal = currentDate, shift <= currentShift
-    const entries = await prisma.dailyEntry.findMany({
-      where: {
-        productId,
-        OR: [
-          { date: { lt: currentDate } },
-          {
-            date: currentDate,
-            shift: { in: shiftsUpToCurrent as any[] },
-          },
-        ],
-      },
-      orderBy: [{ date: "asc" }, { shift: "asc" }],
-      select: {
-        beforeIpqc: true,
-        afterIpqc: true,
-        onGoingPostcured: true,
-        afterPostcured: true,
-        date: true,
-        shift: true,
-      },
+    const result = await getPreviousQty({
+      productId,
+      date,
+      shift: shift as Shift,
     })
 
-    if (entries.length === 0) {
-      return res.json({
-        found: false,
-        beforeIpqc: 0,
-        afterIpqc: 0,
-        onGoingPostcured: 0,
-        afterPostcured: 0,
-        totalInputs: 0,
+    return res.json(result)
+  } catch (e: any) {
+    console.error("GET /previous-qty error:", e)
+
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({
+        error: "Invalid query params",
+        details: e.issues,
       })
     }
 
-    const totalInputs = entries.length
-
-    const totalBeforeIpqc = entries.reduce(
-      (sum, e) => sum + Math.max(0, e.beforeIpqc),
-      0
-    )
-    const totalAfterIpqc = entries.reduce(
-      (sum, e) => sum + Math.max(0, e.afterIpqc),
-      0
-    )
-    const totalOnGoingPostcured = entries.reduce(
-      (sum, e) => sum + Math.max(0, e.onGoingPostcured),
-      0
-    )
-    const totalAfterPostcured = entries.reduce(
-      (sum, e) => sum + Math.max(0, e.afterPostcured),
-      0
-    )
-
-    // 🔥 SISA per proses
-    const remainingBeforeIpqc = Math.max(0, totalBeforeIpqc - totalAfterIpqc)
-    const remainingAfterIpqc = Math.max(0, totalAfterIpqc - totalAfterPostcured)
-    const remainingAfterPostcured = totalAfterPostcured // tahap terakhir
-
-    const lastEntry = entries[entries.length - 1]
-
-    const sisaQty = {
-      found: true,
-
-      // 👇 Nilai sisa per proses (dipakai di history / prefill form)
-      beforeIpqc: remainingBeforeIpqc,
-      afterIpqc: remainingAfterIpqc,
-      afterPostcured: remainingAfterPostcured,
-
-      // 👇 Nilai kumulatif mentah kalau mau dipakai di dashboard / debug
-      rawBeforeIpqc: totalBeforeIpqc,
-      rawAfterIpqc: totalAfterIpqc,
-      rawOnGoingPostcured: totalOnGoingPostcured,
-      rawAfterPostcured: totalAfterPostcured,
-
-      previousDate: lastEntry.date.toISOString().slice(0, 10),
-      previousShift: lastEntry.shift,
-      totalInputs,
-    }
-
-    res.json(sisaQty)
-  } catch (e: any) {
-    console.error("GET /previous-qty error:", e)
-    res.status(400).json({ error: "Invalid query" })
+    return res.status(500).json({
+      error: "Internal server error",
+    })
   }
 })
 
